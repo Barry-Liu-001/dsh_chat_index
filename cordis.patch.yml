@@ -1,0 +1,14 @@
+# ============================================================================
+# dsh-chat-index — DeepSeek Harness bundle patch
+#
+# Inserts this bundle's host (Node) entry into the Loader tree. The host
+# entry is a no-op: all behavior lives in the browser half (./client.js),
+# which renders the conversation dot-rail. The node half scans enabled
+# Loader entries for web `dsh.client` packages, so no client-side row is
+# needed here — the browser bundle is picked up from package.json's
+# `dsh.client` + `exports["./client"]` automatically.
+# ============================================================================
+
+- insert:
+    - id: dsh-chat-index
+      name: 'dsh-chat-index'
