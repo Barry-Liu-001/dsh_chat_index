@@ -2,25 +2,34 @@
  * dsh-chat-index — browser (client) bundle.
  *
  * Hand-written in the DSH client module factory format (classic script that
- * registers a CJS factory via window.__ModuleLoader__): the node half scans
- * enabled Loader entries for `dsh.client` packages and serves this file under
- * /plugins. The factory uses no require() at all — the whole feature is plain
- * DOM/CSS glued to stable, data-attribute seams of the conversation shell:
+ * registers a CJS factory via window.__ModuleLoader__). The node half serves
+ * this file under /plugins; the browser factory uses no require() — it talks
+ * to the host half through one documented seam: the lightweight question-index
+ * endpoint `GET /chat-index.questions?session=<id>` (registered by
+ * ./index.js), which returns every user question as `{ seq, time, id, text }`.
+ *
+ * Design change vs. the previous build:
+ *   - The rail no longer needs the full conversation to be expanded. It reads
+ *     the complete question list from the host (a few KB), so the client keeps
+ *     the default 50-message window and does NOT auto-click "load older" — no
+ *     history is forced into memory.
+ *   - Each dot is one user question (all of them, loaded or not). Hover shows
+ *     the question text (from the endpoint). Click scrolls to the message; a
+ *     question outside the loaded window is reached by on-demand paging (only
+ *     when you click it — bounded to that point, not the whole history).
+ *
+ * The factory injects `sessions` to learn the current session id; everything
+ * else is plain DOM/CSS glued to stable, data-attribute seams of the shell:
  *
  *   - [data-conversation-scroll]      the chat scrollport (one active per shell)
- *   - [data-chat-flow-kind="user"]    a user message flow row
- *   - [data-chat-flow-key]            stable per-message key
+ *   - [data-chat-flow-key]            stable per-message key = "N:input-message" + messageId
  *   - [data-time-hover-root]          the user bubble row inside a flow row
  *   - [data-composer-seat]            the sticky composer (rail bottom inset)
  *
  * It renders a single fixed dot-rail over the right edge of whichever
- * conversation scrollport is currently on screen (the shell can mount/replace
- * containers during boot and session transitions, so the active container is
- * re-picked on every sync rather than bound once). Each dot is one user
- * message; the dots form a compact, evenly-spaced column centered vertically
- * in the chat viewport (the blue dot marks the current reading position).
- * Hovering a dot shows an abbreviation tooltip; clicking smooth-scrolls to
- * the message and flashes its bubble.
+ * conversation scrollport is currently on screen (re-picked on every sync).
+ * Dots form a compact, evenly-spaced column centered vertically in the chat
+ * viewport; the brand-colored dot marks the current reading position.
  */
 window.__ModuleLoader__.load({
 	id: "dsh-chat-index",
@@ -32,17 +41,22 @@ window.__ModuleLoader__.load({
 		const PLUGIN = "dsh-chat-index";
 		const CSS_TAG_ID = "dsh-chat-index/rail.css";
 		const SCROLL_SEL = "[data-conversation-scroll]";
-		const USER_SEL = '[data-chat-flow-kind="user"]';
 		const FLOW_KEY_ATTR = "data-chat-flow-key";
 		const SYNC_INTERVAL_MS = 5000;
 		const ABBREV_LIMIT = 100;
 		const DOT_SIZE = 8; // match .dci_dot width/height
 		const DOT_HALF = DOT_SIZE / 2;
 		const DOT_SPACING = 14; // preferred center-to-center gap, px
-		const AUTO_LOAD_OLDER = true; // auto-click "load older" so all history is indexed
-		const OLDER_CLICK_PACE_MS = 500; // min interval between paging clicks
-		const OLDER_MAX_CLICKS = 1000; // safety valve against a never-ending pager
-		const OLDER_IDLE_STOP = 3; // consecutive syncs without a clickable button → consider fully loaded
+		const QUESTIONS_PATH = "/chat-index.questions";
+		const QUESTION_TTL_MS = 8000; // don't hammer the endpoint faster than this
+		const OLDER_CLICK_PACE_MS = 400; // min interval between on-demand paging clicks
+		const OLDER_MAX_CLICKS = 2000; // safety valve for on-demand paging
+		// Rendered message key prefix for user/steering rows (conversationContextKey).
+		// Built dynamically so a kind-length change never breaks matching.
+		const USER_KEY_PREFIX = (() => {
+			const kind = "input-message";
+			return String(kind.length) + ":" + kind;
+		})();
 
 		// ----- CSS (theme tokens mirror the built-in DSH chat shell) ----------
 		const CSS = `
@@ -79,16 +93,22 @@ window.__ModuleLoader__.load({
 			return flat.length > ABBREV_LIMIT ? flat.slice(0, ABBREV_LIMIT) + "…" : flat;
 		}
 
-		/**
-		 * Extract the user's prose from a `[data-chat-flow-kind="user"]` row.
-		 * The row also holds icon-only action buttons (copy/clock), images and
-		 * an optional reference summary; clone and strip everything non-prose.
-		 */
-		function extractText(item) {
-			const row = item.querySelector("[data-time-hover-root]") || item;
-			const clone = row.cloneNode(true);
-			clone.querySelectorAll("button, svg, img, input, textarea").forEach((el) => el.remove());
-			return normalize(clone.textContent);
+		/** Extract a messageId from a rendered `data-chat-flow-key` value. */
+		function messageIdFromKey(key) {
+			if (typeof key !== "string") return null;
+			if (!key.startsWith(USER_KEY_PREFIX)) return null;
+			const id = key.slice(USER_KEY_PREFIX.length);
+			return id.length > 0 ? id : null;
+		}
+
+		/** The rendered row for one message id (user or steering rows). */
+		function rowForId(id) {
+			const wanted = USER_KEY_PREFIX + id;
+			const rows = document.querySelectorAll("[" + FLOW_KEY_ATTR + "]");
+			for (const row of rows) {
+				if (row.getAttribute(FLOW_KEY_ATTR) === wanted) return row;
+			}
+			return null;
 		}
 
 		/** The tight bubble element (for the click flash); falls back to the row. */
@@ -116,9 +136,8 @@ window.__ModuleLoader__.load({
 			let best = null;
 			let bestScore = -1;
 			for (const el of candidates) {
-				const userCount = el.querySelectorAll(USER_SEL).length;
+				const userCount = el.querySelectorAll('[data-chat-flow-key]').length;
 				const area = visibleArea(el);
-				// weight: each rendered user message matters far more than area
 				const score = userCount * 1e9 + area;
 				if (score > bestScore) {
 					bestScore = score;
@@ -129,10 +148,10 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Find the "load older messages" paging button inside a scrollport.
-		 * Structural heuristic: the first visible button inside the flow column
-		 * that is NOT inside a chat flow row, has text content, and sits in the
-		 * top portion of the scrollport. Returns null when history is fully loaded.
+		 * Find the "load older messages" paging button inside a scrollport
+		 * (DSH's own pager, left visible). Structural heuristic: the first
+		 * visible button inside the flow column that is NOT inside a chat flow
+		 * row, has text, and sits in the top portion of the scrollport.
 		 */
 		function findOlderButton(scrollEl) {
 			const column = scrollEl.querySelector("[data-chat-flow]") || scrollEl;
@@ -142,13 +161,12 @@ window.__ModuleLoader__.load({
 			let best = null;
 			let bestY = Infinity;
 			for (const btn of buttons) {
-				if (btn.closest(USER_SEL)) continue; // message copy/clock/etc.
-				if (btn.closest(".dci_rail")) continue; // our own dots (defensive)
+				if (btn.closest(".dci_rail")) continue; // our own dots
+				if (btn.closest('[data-chat-flow-key]')) continue; // message copy/clock etc.
 				const text = (btn.textContent || "").trim();
 				if (!text) continue; // icon-only buttons (back-to-bottom, etc.)
 				const r = btn.getBoundingClientRect();
 				if (r.width <= 0 || r.height <= 0) continue; // hidden
-				// The pager is in the upper part of the scrollport (above messages).
 				const yInScroll = r.top - viewTop + scrollTop;
 				if (yInScroll < 0 || yInScroll > scrollEl.clientHeight * 0.5) continue;
 				if (yInScroll < bestY) {
@@ -159,38 +177,91 @@ window.__ModuleLoader__.load({
 			return best;
 		}
 
+		// ----- host question index ------------------------------------------
 		/**
-		 * Collapse the transcript's paging: click "load older" whenever it is
-		 * available and idle, so every message (including older history) is
-		 * rendered and indexed. The shell anchors scroll on prepend, so this
-		 * does not yank the reader's position. Paced by a min interval and a
-		 * high safety cap; React disables the button while a page loads.
-		 *
-		 * Stops permanently once the button is absent for OLDER_IDLE_STOP
-		 * consecutive syncs — no more "endless clicking" when history ends.
+		 * Load the complete user-question list from the host endpoint. Cached
+		 * per session for QUESTION_TTL_MS; a manual refresh is forced on
+		 * session change. Returns the item array (or null on failure).
 		 */
-		function maybeAutoLoadOlder(scrollEl) {
-			if (!AUTO_LOAD_OLDER) return;
-			if (state.olderFullyLoaded) return;
-			if (state.olderClicks >= OLDER_MAX_CLICKS) return;
-			const btn = findOlderButton(scrollEl);
-			if (!btn || btn.disabled) {
-				state.olderIdleSyncs = (state.olderIdleSyncs || 0) + 1;
-				if (state.olderIdleSyncs >= OLDER_IDLE_STOP) {
-					state.olderFullyLoaded = true;
-				}
-				return;
-			}
-			state.olderIdleSyncs = 0;
-			const now = Date.now();
-			if (now - state.olderLastClickAt < OLDER_CLICK_PACE_MS) return;
-			state.olderLastClickAt = now;
-			state.olderClicks += 1;
+		async function fetchQuestions(sessionId) {
 			try {
-				btn.click();
+				const url = QUESTIONS_PATH + "?session=" + encodeURIComponent(sessionId);
+				const res = await fetch(url, { headers: { accept: "application/json" } });
+				if (!res.ok) return null;
+				const body = await res.json();
+				return Array.isArray(body.items) ? body.items : null;
 			} catch {
-				// a detached/odd button — ignore; next sync retries
+				return null;
 			}
+		}
+
+		/**
+		 * Rebuild the question index for the given session. Called when the
+		 * current session changes, or when a rendered message is not yet in the
+		 * index (the log grew since the last fetch). Throttled by TTL.
+		 */
+		function refreshQuestions(sessionId, force) {
+			if (!sessionId) return;
+			const now = Date.now();
+			if (!force && state.questionAt !== 0 && now - state.questionAt < QUESTION_TTL_MS) return;
+			if (state.fetchingQuestions) return;
+			state.fetchingQuestions = true;
+			state.questionAt = now;
+			fetchQuestions(sessionId).then((items) => {
+				state.fetchingQuestions = false;
+				if (items === null) return;
+				state.sessionId = sessionId;
+				state.questions = items;
+				state.idxById = new Map();
+				for (let i = 0; i < items.length; i += 1) {
+					if (items[i] && items[i].id != null) state.idxById.set(String(items[i].id), i);
+				}
+				schedule();
+			});
+		}
+
+		/** True when any rendered message id is missing from the index. */
+		function renderedMessagesOutdated(scrollEl) {
+			const rows = scrollEl.querySelectorAll("[" + FLOW_KEY_ATTR + "]");
+			for (const row of rows) {
+				const id = messageIdFromKey(row.getAttribute(FLOW_KEY_ATTR));
+				if (id !== null && !state.idxById.has(id)) return true;
+			}
+			return false;
+		}
+
+		/**
+		 * On-demand paging: click "load older" (paced) until the message with
+		 * the given id is rendered, then resolve. Used only when a user clicks
+		 * a dot for a message outside the loaded window — the memory cost is
+		 * bounded to the point the user navigated to.
+		 * @returns true when the target was reached.
+		 */
+		async function loadUntilRendered(id, signal) {
+			let clicks = 0;
+			while (!signal.aborted && clicks < OLDER_MAX_CLICKS) {
+				const row = rowForId(id);
+				if (row && row.isConnected && row.getBoundingClientRect().width > 0) return true;
+				const btn = findOlderButton(state.scrollEl);
+				if (!btn || btn.disabled) {
+					// No pager (history fully loaded) — check once more.
+					if (!btn) return Boolean(rowForId(id) && rowForId(id).isConnected);
+					await wait(OLDER_CLICK_PACE_MS);
+					continue;
+				}
+				try {
+					btn.click();
+				} catch {
+					// detached / odd — next iteration retries
+				}
+				clicks += 1;
+				await wait(OLDER_CLICK_PACE_MS);
+			}
+			return Boolean(rowForId(id) && rowForId(id).isConnected);
+		}
+
+		function wait(ms) {
+			return new Promise((resolve) => setTimeout(resolve, ms));
 		}
 
 		// ----- plugin state (single rail, rebound active scroll) -------------
@@ -198,15 +269,16 @@ window.__ModuleLoader__.load({
 			rail: null,
 			tip: null,
 			scrollEl: null,
-			dots: new Map(), // key -> { el, item, key, text, idx, y, contentY }
+			sessionId: null,
+			questions: [], // [{ seq, time, id, text }] — all user questions, ascending seq
+			idxById: new Map(), // messageId -> index into questions
+			questionAt: 0,
+			fetchingQuestions: false,
+			dots: new Map(), // messageId -> { el, id, text, idx, y, contentY }
 			raf: 0,
 			ro: null,
 			interval: 0,
 			flashTimers: new Map(),
-			olderLastClickAt: 0,
-			olderClicks: 0,
-			olderIdleSyncs: 0, // consecutive syncs without a clickable "load older"
-			olderFullyLoaded: false, // set once history is fully expanded
 		};
 
 		function schedule() {
@@ -234,8 +306,6 @@ window.__ModuleLoader__.load({
 			tip.appendChild(num);
 			tip.appendChild(document.createTextNode(abbreviate(entry.text)));
 			tip.classList.add("dci_show");
-			// Position to the left of the hovered dot (fixed, in viewport coords),
-			// flipping to the right if there is no room; clamp to viewport edges.
 			const dot = entry.el.getBoundingClientRect();
 			const tipH = tip.offsetHeight || 32;
 			const tipW = tip.offsetWidth || 200;
@@ -253,38 +323,25 @@ window.__ModuleLoader__.load({
 			state.tip.classList.remove("dci_show");
 		}
 
-		function jumpTo(entry) {
-			hideTip();
+		function scrollToRow(row) {
 			const scrollEl = state.scrollEl;
-			if (!scrollEl) return;
-			const item = entry.item;
-			if (!item || !item.isConnected) return;
-
-			// Re-measure at click time — cached contentY may be stale after
-			// streaming output, layout shifts, or virtualized re-mounts.
+			if (!scrollEl || !row || !row.isConnected) return;
 			const srect = scrollEl.getBoundingClientRect();
-			const r = item.getBoundingClientRect();
+			const r = row.getBoundingClientRect();
 			const contentY = r.top - srect.top + scrollEl.scrollTop;
 			const target = Math.max(0, contentY - scrollEl.clientHeight * 0.25);
-
-			// Use instant scroll for precision; smooth scroll drifts when content
-			// is still being rendered around the target.
 			scrollEl.scrollTo({ top: target, behavior: "auto" });
-
-			// Second pass: after the scroll settles, re-check and nudge if the
-			// target moved (e.g. lazy-loaded images, expanding code blocks).
 			requestAnimationFrame(() => {
-				if (!item.isConnected) return;
+				if (!row.isConnected) return;
 				const srect2 = scrollEl.getBoundingClientRect();
-				const r2 = item.getBoundingClientRect();
+				const r2 = row.getBoundingClientRect();
 				const contentY2 = r2.top - srect2.top + scrollEl.scrollTop;
 				const target2 = Math.max(0, contentY2 - scrollEl.clientHeight * 0.25);
 				if (Math.abs(target2 - scrollEl.scrollTop) > 4) {
 					scrollEl.scrollTo({ top: target2, behavior: "auto" });
 				}
 			});
-
-			const bubble = bubbleOf(item);
+			const bubble = bubbleOf(row);
 			bubble.classList.remove("dci_flash");
 			void bubble.offsetWidth; // restart the animation
 			bubble.classList.add("dci_flash");
@@ -299,6 +356,28 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		async function jumpTo(entry) {
+			hideTip();
+			const id = entry.id;
+			if (!id) return;
+			let row = rowForId(id);
+			if (row && row.isConnected && row.getBoundingClientRect().width > 0) {
+				scrollToRow(row);
+				return;
+			}
+			// Outside the loaded window: page in on demand (bounded to this point).
+			// Abort any earlier in-flight jump so concurrent clicks don't fight.
+			if (state.currentJumpAbort) state.currentJumpAbort.aborted = true;
+			const aborted = { aborted: false };
+			state.currentJumpAbort = aborted;
+			const reached = await loadUntilRendered(id, aborted);
+			if (state.currentJumpAbort === aborted) state.currentJumpAbort = null;
+			if (reached) {
+				const final = rowForId(id);
+				if (final && final.isConnected) scrollToRow(final);
+			}
+		}
+
 		function clearDots() {
 			for (const entry of state.dots.values()) entry.el.remove();
 			state.dots.clear();
@@ -306,7 +385,9 @@ window.__ModuleLoader__.load({
 
 		/**
 		 * Recompute the active scrollport, rail geometry, dot set/positions and
-		 * the active dot. Runs on rAF; cheap because user messages are few.
+		 * the active dot. The dot set comes from the host question index (all
+		 * questions, loaded or not); the active dot is derived from which
+		 * rendered message row is currently at the reading anchor.
 		 */
 		function sync() {
 			const rail = state.rail;
@@ -329,22 +410,27 @@ window.__ModuleLoader__.load({
 				state.ro.observe(scrollEl);
 				state.scrollEl = scrollEl;
 				clearDots();
-				state.olderLastClickAt = 0;
-				state.olderClicks = 0;
-				state.olderIdleSyncs = 0;
-				state.olderFullyLoaded = false;
 			}
 
-			// Expand any paged-away older history so every user message is
-			// rendered and indexable (runs even when the rail itself is hidden).
-			maybeAutoLoadOlder(scrollEl);
+			// Learn the current session id and keep the question index fresh.
+			const sessions = ctx && ctx.sessions;
+			const current = sessions && sessions.list && sessions.list.getSnapshot
+				? sessions.list.getSnapshot().current
+				: undefined;
+			if (current && current !== state.sessionId) {
+				state.sessionId = current;
+				state.questions = [];
+				state.idxById.clear();
+				state.questionAt = 0;
+				refreshQuestions(current, true);
+			} else if (current && renderedMessagesOutdated(scrollEl)) {
+				// The log grew since the last fetch — pull an update (TTL throttled).
+				refreshQuestions(current, false);
+			}
 
 			const srect = scrollEl.getBoundingClientRect();
-			const items = Array.from(scrollEl.querySelectorAll(USER_SEL)).filter((el) => {
-				const r = el.getBoundingClientRect();
-				return r.width > 0 && r.height > 0;
-			});
-			if (items.length < 2) {
+			const n = state.questions.length;
+			if (n < 2) {
 				rail.style.display = "none";
 				return;
 			}
@@ -363,29 +449,24 @@ window.__ModuleLoader__.load({
 			}
 
 			rail.style.visibility = "visible";
-			// The class ships display:none as the pre-JS hidden state; the show
-			// branch must set an explicit value (clearing the inline style would
-			// fall back to the stylesheet's none and keep the rail invisible).
 			rail.style.display = "block";
 			rail.style.top = srect.top + 8 + "px";
 			rail.style.left = srect.right - 26 + "px";
 			rail.style.height = height + "px";
 
-			// Evenly-spaced, vertically-centered dot cluster (NOT a proportional
-			// minimap): equal small gaps, whole column centered in the rail. When
-			// there are too many messages to fit at the preferred spacing, compress
-			// the gap so the cluster still fits.
-			const n = items.length;
+			// Evenly-spaced, vertically-centered dot cluster. When there are too
+			// many questions to fit at the preferred spacing, compress the gap.
 			const spacing = Math.min(DOT_SPACING, (height - DOT_SIZE) / Math.max(1, n - 1));
 			const blockH = (n - 1) * spacing;
 			const startY = Math.max(DOT_HALF, (height - blockH) / 2);
 
 			const anchor = scrollEl.scrollTop + scrollEl.clientHeight * 0.35;
 			const seen = new Set();
-			let activeKey = null;
 
-			items.forEach((item, idx) => {
-				const key = item.getAttribute(FLOW_KEY_ATTR) || "idx-" + idx;
+			// Ensure one dot per question (all of them — cheap, from the index).
+			state.questions.forEach((q, idx) => {
+				if (!q || q.id == null) return;
+				const key = String(q.id);
 				seen.add(key);
 				let entry = state.dots.get(key);
 				if (!entry) {
@@ -393,27 +474,39 @@ window.__ModuleLoader__.load({
 					el.type = "button";
 					el.className = "dci_dot";
 					rail.appendChild(el);
-					entry = { el, item, key, text: "", idx, y: 0, contentY: 0 };
+					entry = { el, id: key, text: "", idx, y: 0, contentY: 0 };
 					state.dots.set(key, entry);
 				}
-				entry.item = item;
 				entry.idx = idx;
-				const rawText = extractText(item);
-				const text = rawText || "（图片/附件消息）";
+				const text = q.text || "（图片/附件消息）";
 				if (text !== entry.text) {
 					entry.text = text;
-					entry.el.setAttribute("aria-label", "跳转到第 " + (idx + 1) + " 条用户消息：" + abbreviate(text));
+					entry.el.setAttribute(
+						"aria-label",
+						"跳转到第 " + (idx + 1) + " 条用户消息：" + abbreviate(text),
+					);
 				}
-				// contentY (message position in the scrollport) is kept only for
-				// click-to-scroll; the dot itself sits in the even centered layout.
-				const r = item.getBoundingClientRect();
-				const contentY = r.top - srect.top + scrollEl.scrollTop;
-				entry.contentY = contentY;
-				const cy = startY + idx * spacing; // dot center within the rail
+				const cy = startY + idx * spacing;
 				entry.y = cy;
 				entry.el.style.top = cy - DOT_HALF + "px";
-				if (contentY <= anchor) activeKey = key;
+				entry.el.classList.remove("is-active");
 			});
+
+			// Active dot: the most recent rendered message row at/above the anchor.
+			// Rows are the loaded tail; older (unloaded) dots simply stay inactive.
+			let activeKey = null;
+			const rows = scrollEl.querySelectorAll("[" + FLOW_KEY_ATTR + "]");
+			for (const row of rows) {
+				const id = messageIdFromKey(row.getAttribute(FLOW_KEY_ATTR));
+				if (id === null) continue;
+				const r = row.getBoundingClientRect();
+				if (r.width <= 0 || r.height <= 0) continue;
+				const contentY = r.top - srect.top + scrollEl.scrollTop;
+				if (contentY <= anchor) {
+					const dotKey = String(id);
+					if (state.dots.has(dotKey)) activeKey = dotKey;
+				}
+			}
 
 			for (const [key, entry] of state.dots) {
 				if (!seen.has(key)) {
@@ -426,9 +519,11 @@ window.__ModuleLoader__.load({
 		}
 
 		// ----- plugin body ----------------------------------------------------
-		const inject = [];
+		const inject = ["sessions"];
+		let ctx = null;
 
-		function apply() {
+		function apply(c) {
+			ctx = c;
 			injectCss();
 
 			// Factories can materialize during <head> parse, before <body> exists;
@@ -478,12 +573,13 @@ window.__ModuleLoader__.load({
 			});
 			rail.addEventListener("click", (e) => {
 				const entry = entryFromTarget(e.target);
-				if (entry) jumpTo(entry);
+				if (entry) void jumpTo(entry);
 			});
 
 			schedule();
 
 			return () => {
+				if (state.currentJumpAbort) state.currentJumpAbort.aborted = true;
 				observer.disconnect();
 				state.ro?.disconnect();
 				window.removeEventListener("scroll", schedule, true);

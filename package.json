@@ -1,9 +1,20 @@
 {
   "name": "dsh-chat-index",
   "version": "0.1.0",
-  "description": "DeepSeek Harness (DSH) conversation index plugin: a dot rail on the right edge of the chat — each dot is a user message; hover shows an abbreviation, click jumps to it.",
+  "description": "DeepSeek Harness (DSH) conversation index plugin: a dot rail on the right edge of the chat — each dot is a user question; hover shows an abbreviation, click jumps to it.",
   "type": "module",
   "license": "MIT",
+  "homepage": "https://github.com/Barry-Liu-001/dsh_chat_index#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Barry-Liu-001/dsh_chat_index.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Barry-Liu-001/dsh_chat_index/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
@@ -31,6 +42,7 @@
     },
     "client": {
       "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-client-runtime"
       ],
       "platform": "web"
